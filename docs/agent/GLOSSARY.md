@@ -6,7 +6,9 @@ Terms as used in this repository. Primary definitions live in `skills/agentflow/
 
 **Host** — the interactive AI assistant running the skill (Codex, Claude Code, or a generic host identified by a safe ID). Also called the *coordinator*. Passed as `--host <safe-id>`; Codex/Claude also carry `--host-family`. See `ag-settings.js:detect_host`, `normalise_host`.
 
-**Session** — host session identity used for ownership (`--session`, `AGENTFLOW_SESSION_ID`, `CODEX_THREAD_ID`/`CODEX_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`).
+**Session** — host session identity used for ownership (`--session`, `AGENTFLOW_SESSION_ID`, `CODEX_THREAD_ID`/`CODEX_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`). For Claude, `agf start` reports it as `session_id` (since 8.4.15) for later manual captures.
+
+**Manual capture** — running `notebook-write.js append-input --input-stdin` yourself for each actual owner message. Required on Claude since 8.4.15 (`--host claude --session <startup session_id>`; `hooks.prompt_capture: 'manual'` in the start result) and on hookless hosts; Codex captures via its `UserPromptSubmit` hook.
 
 **Notebook / devlog / target-doc** — the tracked Markdown file holding all conversation history; default `.agentflow/devlog.md`, configured by `switches.target-doc`. Written only by `scripts/notebook-write.js`.
 
@@ -80,7 +82,7 @@ Terms as used in this repository. Primary definitions live in `skills/agentflow/
 
 **Design Go / Result Go** — explicit owner gates for consequential work (`Design Go: <7-hex commit prefix>`). May be supplied after evidence passes by current-Ask `away: gates` or by the `away-gates: on` switch.
 
-**`away-gates`** — optional `on|off` switch (default `off`, since 8.4.5): project-wide form of `away: gates`. Read by `completion-context.js:collect`; enforced in `round-linter.js:lint_quality_gate`.
+**`away-gates`** — optional `on|off` switch (absent = `off`, since 8.4.5; new Codex templates write `on` since 8.4.15): project-wide form of `away: gates`. Read by `completion-context.js:collect`; enforced in `round-linter.js:lint_quality_gate`.
 
 **Config audit (`config_audit`)** — startup result field (since 8.4.7) listing template properties added to `ag.json` (`added`) and invalid saved values with template suggestions (`invalid`). `ag-settings.js:audit_template`.
 
@@ -92,7 +94,7 @@ Terms as used in this repository. Primary definitions live in `skills/agentflow/
 
 **Frozen queue / plan** — `plan-NNN.md` files plus digest-bound `.queue-generation.json`, produced by `make-plans` (`queue-contract.js`). **Looper** runs them sequentially (`agf-looper`, `looper.js`). `run-looper` / `run-plans` are the exact triggers.
 
-**Referee / Stop hook** — `stop-hook.js`; grades completed rounds at end of turn; exit `2` asks for one correcting turn.
+**Referee / Stop hook** — `stop-hook.js`; grades completed rounds at end of turn; exit `2` asks for one correcting turn. Installed for both Codex and Claude (the same script also serves Codex's `UserPromptSubmit` capture).
 
 **Round linter** — `round-linter.js:lint_round`; deterministic checks with `pass|warn|skip|fail`.
 

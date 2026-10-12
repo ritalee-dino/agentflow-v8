@@ -14,7 +14,7 @@ flowchart TD
     Owner([Owner]) -->|messages| Host[Host agent: Codex / Claude / generic]
     Host -->|reads| Skill[SKILL.md + triggered references]
     Host -->|agf start / close / settings / new ...| AGF[agf.js]
-    HostHooks[Host hooks] -->|Stop, UserPromptSubmit| StopHook[stop-hook.js]
+    HostHooks[Host hooks] -->|Stop; UserPromptSubmit on Codex| StopHook[stop-hook.js]
     Host -->|dispatch| Deleg[delegation-route.js]
     Deleg --> ExtRun[external-runner.js]
     ExtRun -->|codex exec / claude -p in no-remote clone| Worker([External worker])
@@ -34,12 +34,12 @@ flowchart TD
 - `agf.js` — unified CLI and orchestration of start, close (validate → replace → commit → push), streams (`new`, `finish --prep/--deliver`, `cleanup`, `ditch`), `init`, `setup`, `hooks`, `settings`, `review`, `uninstall`; delegates `owner`, `compact`, `skills` to other modules. Holds the delivery lock (`acquire_delivery_lock`).
 - `looper.js` — standalone sequential plan runner (`agf-looper`), plus interactive-host claim API (`claim_host_plan`, `finish_host_plan`).
 - `setup.js` — shell shortcut (`agf()`, `agf-looper()`) detection/installation.
-- `install-hook.js` — install/remove Stop + UserPromptSubmit hooks in `.claude/settings.json` or `.codex/hooks.json` (project or global) and the Git pre-commit guard. Since 8.4.9/8.4.11 generated commands point at the installed skill copy (`installed_script_for`: `~/.<host>/skills/agentflow/scripts/`, then the other host's global copy, then the running installation), keeping symlink spelling; recognized older Agentflow commands (`is_legacy_agentflow_command`) and guard scripts (`is_our_guard`) are migrated in place while unrelated hooks are preserved.
+- `install-hook.js` — install/remove Stop + UserPromptSubmit hooks in `.codex/hooks.json` and the Stop hook in `.claude/settings.json` (project or global), and the Git pre-commit guard. Since 8.4.15 installing for Claude removes owned Claude `UserPromptSubmit` hooks in the selected scope and returns `prompt_capture: 'manual'` with `claude_capture_instructions` (manual `notebook-write.js append-input --host claude --session <id>`); unrelated hooks and other scopes are untouched. Since 8.4.9/8.4.11 generated commands point at the installed skill copy (`installed_script_for`: `~/.<host>/skills/agentflow/scripts/`, then the other host's global copy, then the running installation), keeping symlink spelling; recognized older Agentflow commands (`is_legacy_agentflow_command`) and guard scripts (`is_our_guard`) are migrated in place while unrelated hooks are preserved.
 
 **Notebook core**
 - `notebook-write.js` — the only notebook writer: append input/RUN/WIP/Reply, `close_round`, `prepare_close_candidate`, locks (`acquire_close_round_lock`), atomic replace, input/close receipts under `<workspace>/.tmp/`.
 - `notebook-owner.js` — per-notebook session ownership (`guard`, `verify`, `release`, `inspect`, `transfer`/adopt CLI). Records at `<workspace>/.tmp/agentflow-owner-<sha256>.json`. Record enforcement is gated by the `notebook-ownership` switch (default `off`); the guard/verify context is still required by every writer in both modes.
-- `notebook-compact.js` — byte-verified archival of completed rounds into `<basename>.archive.md`.
+- `notebook-compact.js` — byte-verified archival of completed rounds into `<basename>.archive.md`; since 8.4.15 the latest completed round always stays live, even when forced.
 - `resume-intake.js` — read-only startup intake: STATUS, final Ask, changed paths, `stream_decision`.
 - `repository-state.js` — detects `git` vs `plain` folder vs error.
 
@@ -110,14 +110,14 @@ Writes are atomic (temp file + rename), guarded by lock files and identity/hash 
 
 - **Git CLI** — branches, worktrees (`.worktrees/<taskkey>`), commits with `Agentflow-Close-Id` trailer, non-force push with remote SHA verification.
 - **Host CLIs as workers** — `codex exec`, `claude -p` (profiles in `ag.json` `external-workers`), launched only via `external-runner.js`.
-- **Host hook systems** — Claude Code `.claude/settings.json`, Codex `.codex/hooks.json`; both use `{hooks: {Stop|UserPromptSubmit: [...]}}` and call `stop-hook.js --host <codex|claude>` from the installed skill directory (not a development checkout; see `install-hook.js` above).
+- **Host hook systems** — Claude Code `.claude/settings.json`, Codex `.codex/hooks.json`; both use `{hooks: {Stop|UserPromptSubmit: [...]}}` and call `stop-hook.js --host <codex|claude>` from the installed skill directory (not a development checkout; see `install-hook.js` above). Since 8.4.15 Agentflow installs only `Stop` for Claude (prompt events cannot prove an owner submission, issue #27); a stale Claude `UserPromptSubmit` call exits 0 silently.
 - **Host transcripts** — read by `reply-identity.js` / `completion-context.js` for Reply stamps and terminal-output checks.
 - **Shell rc files** — `setup.js --fix` appends managed `agf()`/`agf-looper()` functions after backup.
 
 ## Authorization model
 
 No user auth. "Authorization" means **notebook ownership and owner authority**:
-- With `notebook-ownership: on`, one host+session owns the active Ask (`notebook-owner.js:guard`); foreign identities are refused before mutation. With `off` (default), sessions may share the Ask, but conflicting identity, current-Ask changes and policy changes are still refused. Identity comes from `--host/--session`, `AGENTFLOW_SESSION_ID`, or host env vars.
+- With `notebook-ownership: on`, one host+session owns the active Ask (`notebook-owner.js:guard`); foreign identities are refused before mutation. With `off` (default), sessions may share the Ask, but conflicting identity, current-Ask changes and policy changes are still refused. Identity comes from `--host/--session`, `AGENTFLOW_SESSION_ID`, or host env vars. For Claude, `agf start` returns the resolved `session_id` (since 8.4.15) so manual captures pass the same session.
 - Takeover (ownership `on`) requires `agf owner adopt` with exact Ask, expected token, and notebook SHA-256.
 - Push requires both `delivery.mode: "push"` in the manifest and `--push-authorized`.
 - Mutation authority for the agent comes from the owner's Ask text (policy in `SKILL.md` "Scope and evidence"), not enforced by code.

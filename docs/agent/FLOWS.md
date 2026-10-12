@@ -31,6 +31,7 @@ agf.js:main → COMMANDS.start → start_main
   release locks
   resume-intake.js:collect_intake → STATUS, final Ask, changed paths, stream_decision
   start_result → JSON (repository, notebook, git, next_run_id, setup, message, stream_decision, hooks, optional compaction / fast_lane / skip_ag / config_audit {added, invalid})
+     host claude (since 8.4.15) → also session_id + hooks {status: available, prompt_capture: manual, instructions}
 ```
 
 Side effects: may create `ag.json` (or add missing template properties to an existing one), notebook, `.gitignore` entries, `.claude/settings.json` or `.codex/hooks.json`, ownership record. No commit.
@@ -39,8 +40,11 @@ Tests: `start-journey.test.js`, `agf.test.js`, `resume-intake.test.js`, `git-opt
 
 ## 2. Per-message capture (UserPromptSubmit hook)
 
+Since 8.4.15 the hook path below is Codex-only. Claude is installed without a `UserPromptSubmit` hook; a stale Claude prompt call exits 0 with no output right after host validation, before any notebook/config access.
+
 ```text
-host hook → stop-hook.js --host <codex|claude> (stdin JSON: hook_event_name, prompt, cwd, session_id, turn_id)
+host hook → stop-hook.js --host codex (stdin JSON: hook_event_name, prompt, cwd, session_id, turn_id)
+  --host claude + UserPromptSubmit → exit 0, silent (since 8.4.15)
   resolve project dir (CLAUDE_PROJECT_DIR for claude, else input.cwd)
   completion-context.js:no_ag_bypass(prompt) → exit 0, no output, nothing read or written (since 8.4.12)
   resolve notebook: linked worktree → stream notebook; else ag.json target-doc
@@ -52,7 +56,7 @@ host hook → stop-hook.js --host <codex|claude> (stdin JSON: hook_event_name, p
   stdout: hookSpecificOutput.additionalContext (+ compaction.message when present, since 8.4.14)
 ```
 
-Hookless hosts run `notebook-write.js append-input --notebook <path> --input-stdin --host <id>` manually. Tests: `stop-hook.test.js`, `notebook-write.test.js`, `notebook-boundary-journey.test.js`, `no-ag-hook.test.js`, `notebook-compact.test.js`.
+Manual capture: Claude runs `notebook-write.js append-input --notebook <path> --host claude --session <startup session_id> --input-stdin` for each actual owner message (since 8.4.15); hookless hosts add their retained `--host <safe-id> --session <id>`. Tests: `stop-hook.test.js`, `stop-hook-recovery.test.js`, `notebook-write.test.js`, `notebook-boundary-journey.test.js`, `no-ag-hook.test.js`, `notebook-compact.test.js`, `start-journey.test.js` (Claude manual capture PTY).
 
 ## 3. Closeout (`agf close`)
 
@@ -172,7 +176,8 @@ Tests: `agf.test.js`, `streams-off.test.js`, `devlog-guard.test.js`, `branch-saf
 ```text
 start / capture → notebook-compact.js:compact_locked(force=false) when ≥ 750 lines (since 8.4.10) or ≥ 768 KiB
 agf compact → compact (locks + ownership) [--include-answered true]
-  select completed rounds in order; stop at the first open round or, unless included,
+  candidates = rounds before the latest completed round (that round always stays live, even forced; since 8.4.15)
+  select candidates in order; stop at the first open round or, unless included,
     the first round with non-empty ans: / -> ask: / -> ans:  → result.blocked + message
   append exact bytes to adjacent archive; verify id, length, SHA-256; then remove live bytes
   blocked → reported as compaction in agf start output and the capture hook notice (since 8.4.14)

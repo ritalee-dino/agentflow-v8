@@ -6,13 +6,13 @@ Agentflow is an **AI-agent skill** (prompt instructions + zero-dependency Node.j
 
 Users: a human "owner" talking to a host agent (verified: Codex CLI and Claude Code; generic hookless hosts supported manually). The scripts are invoked by the host agent, by host hooks, or by the owner through the `agf` / `agf-looper` shell shortcuts.
 
-This repository is the **public release mirror** (current version 8.4.14). Commits are titled `release: agentflow @ <private-sha>`; development happens in a separate private checkout (inferred from commit titles and `SKILL.md` release guidance).
+This repository is the **public release mirror** (current version 8.4.15). Commits are titled `release: agentflow @ <private-sha>`; development happens in a separate private checkout (inferred from commit titles and `SKILL.md` release guidance).
 
 ## Major use cases
 
 - Start or resume a task with `godev` → `agf.js start`.
 - Route controls: per-Ask `fast-lane`, `skip-ag` (skip only the development pipeline/advisors); per-message `no-ag` (bypass the whole protocol for one submitted message, since 8.4.12).
-- Capture every owner message into the current Ask (hook or manual).
+- Capture every owner message into the current Ask (Codex hook; manual on Claude since 8.4.15 and on hookless hosts).
 - Close a round: validate, write Reply + STATUS, commit, optionally push → `agf close`.
 - Referee a finished turn via host Stop hook → `stop-hook.js`.
 - Open / deliver / clean up feature streams → `agf new|finish|cleanup|ditch`.
@@ -36,6 +36,7 @@ CHANGELOG.md             Release history at repo root since 8.4.3 (`release.test
 docs/agent/              This knowledge base
 README.md, README.zh-tw.md  Install/usage (tests assert content)
 copy_skills.sh           Local maintainer helper: copies skill to ~/.agents/skills (not part of product)
+patch/                   Local maintainer helpers (not part of product, zh-TW README): `pre-push` refuses pushes whose commits contain `.agentflow/`, root `ag.json` or an `Agentflow-Close-Id` trailer; `clean-branch.sh` squashes an Agentflow work branch into a clean branch without them
 skills/agentflow/
   SKILL.md               Always-loaded model instructions (version in frontmatter + heading)
   references/            Trigger-loaded rulebooks (closeout, progress, writing, streams, ag, delegation, looper, fast-lane, skip-ag, mixed-requests, skill-conflicts)
@@ -45,14 +46,14 @@ skills/agentflow/
   scripts/fixtures/      Test fixtures (fake external worker, notebook owner helpers, temp dirs)
 ```
 
-Ignored/runtime (not tracked): `.agentflow/` (notebook, `.tmp/` receipts, ownership, completion records), `.worktrees/`, `.codex/`, `.claude/` host settings.
+Ignored/runtime (not tracked): `.agentflow/.tmp/` (receipts, ownership, completion records), `.worktrees/`, `.codex/`, `.claude/` host settings. On the maintainer's `personal/*` branches Agentflow is used on this repo itself, so `.agentflow/devlog.md` and root `ag.json` are tracked there (commit `75f1e90`); they are not product files.
 
 ## Entry points
 
 | Entry | File | Invoked by |
 | --- | --- | --- |
 | `agf <subcommand>` | `skills/agentflow/scripts/agf.js:main` (dispatch table `COMMANDS`) | Host agent, owner shell shortcut |
-| Stop / UserPromptSubmit hook | `skills/agentflow/scripts/stop-hook.js:main` | Codex / Claude hook config |
+| Stop / UserPromptSubmit hook | `skills/agentflow/scripts/stop-hook.js:main` | Codex hook config (Stop + UserPromptSubmit); Claude hook config (Stop only since 8.4.15) |
 | `agf-looper` | `skills/agentflow/scripts/looper.js:main` | Owner / host (`run-looper`, `run-plans`) |
 | Notebook writer CLI (internal) | `skills/agentflow/scripts/notebook-write.js:run` | Host for `append-input`, `append-run`, `append-wip`, `append-reply`, `close-round` |
 | Pre-commit guard | `skills/agentflow/scripts/devlog-guard.js:main` | Git `pre-commit` hook |
@@ -80,14 +81,14 @@ Opt-in / special checks (see `skills/agentflow/scripts/README.md`):
 - `*-journey.js` scripts: real PTY/terminal journeys (some need Expect/macOS; `codex-live-journey.js` and `claude-live-journey.js` make paid model calls).
 - `looper-live-gate.js --report <path>`: mandatory final gate for any looper behavior change (real provider calls).
 
-Platform notes: Unix-only tests skip on native Windows; the looper is not supported on native Windows (per README and CHANGELOG 8.3.4). CHANGELOG 8.3.4 and 8.4.0 record two known pre-existing failing assertions in `prompt-compression.test.js`; at v8.4.4, v8.4.7 and v8.4.14 only the 32 KiB budget assertion was observed failing (see [DECISIONS.md](DECISIONS.md) "Open / uncertain") — do not assume a fully green suite.
+Platform notes: Unix-only tests skip on native Windows; the looper is not supported on native Windows (per README and CHANGELOG 8.3.4). CHANGELOG 8.3.4 and 8.4.0 record two known pre-existing failing assertions in `prompt-compression.test.js`; at v8.4.4, v8.4.7, v8.4.14 and v8.4.15 only the 32 KiB budget assertion was observed failing (see [DECISIONS.md](DECISIONS.md) "Open / uncertain") — do not assume a fully green suite.
 
 Host environment leakage: running tests from inside a Claude Code or Codex session leaks runtime markers listed in `ag-settings.js:host_markers` (e.g. `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SSE_PORT`, `CODEX_THREAD_ID`). Fixtures that set the other host then fail with `AG_HOST_AMBIGUOUS` ("active host is ambiguous"). Unset those variables before running the suite. On native Windows without symlink privilege, symlink-based tests (e.g. in `completion-record.test.js`, `ag-settings.test.js` "target document validation ...") fail with `EPERM`. Since 8.4.9/8.4.11 `install-hook.js:installed_script_for` resolves hook paths under the real `os.homedir()` (`~/.codex|.claude/skills/agentflow/scripts/`), so a globally installed Agentflow on the test machine changes generated hook paths; on 2026-10-05 (native Windows, `~/.claude/skills/agentflow` present) `install-hook.test.js` path/guard cases failed alongside the `EPERM` symlink cases (43 of 1,502 failed overall; cause per test not individually confirmed).
 
 ## Configuration
 
 - `ag.json` (project root, or adjacent to a stream notebook): schema version 8. Root keys `schema-version`, `switches`, `pipeline-roles`, `external-workers`. Owned by `skills/agentflow/scripts/ag-settings.js` (`validate_config`, `load_config`, `migrate_config`, `change_configuration`, `host_template_values`).
-- Important switches: `target-doc` (notebook path, default `.agentflow/devlog.md`), `workspace-dir` (default `.agentflow`), `allowed-worker`, `review-policy`, `allow-ag`, `streams`, `lang`, `log-verbosity`, `inline-reply`, `notebook-ownership` (default `off`), `away-gates` (optional, default `off`, since 8.4.5), `git-timeout-ms`. New templates list switch keys alphabetically (since 8.4.7).
+- Important switches: `target-doc` (notebook path, default `.agentflow/devlog.md`), `workspace-dir` (default `.agentflow`), `allowed-worker`, `review-policy`, `allow-ag`, `streams`, `lang`, `log-verbosity`, `inline-reply`, `notebook-ownership` (default `off`), `away-gates` (optional, absent = `off`, since 8.4.5; the Codex template writes `on` since 8.4.15, the Claude template `off`), `git-timeout-ms`. New templates list switch keys alphabetically (since 8.4.7).
 - Startup template audit (since 8.4.7): `agf start` fills missing template properties into `ag.json` and reports invalid saved values with suggestions (`ag-settings.js:audit_template`); see [FEATURES.md](FEATURES.md) section 10.
 - Environment variables (read, not required): `AGF_GIT_TIMEOUT_MS`, `CODEX_THREAD_ID`/`CODEX_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`/`CLAUDE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `AGENTFLOW_SESSION_ID`, `AGENTFLOW_EXTERNAL_DELEGATE`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `AGF_OPEN`.
 - Version must stay aligned in `SKILL.md` (frontmatter + heading), `.claude-plugin/plugin.json`, `README*.md` heading, and root `CHANGELOG.md`.
