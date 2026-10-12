@@ -41,7 +41,7 @@ const USAGE_COMMANDS = [
 	{ label: 'compact', syntax: 'agf compact --notebook <path> [--host <id>] [--session <id>] [--include-answered true]', description: 'archive completed notebook rounds with byte and hash verification; explicit override includes answered rounds' },
 	{ label: 'init', syntax: 'agf init', description: 'create Agentflow records, ignore entries, and project hooks in one repeatable action' },
 	{ label: 'new', syntax: 'agf new <name> [taskkey] [-m "first ask"]', description: 'open a stream and write its initial notebook; root records stay with the agent' },
-	{ label: 'finish', syntax: 'agf finish --prep [taskkey]', description: 'prepare a worktree by pushing its branch and integrating the default branch' },
+	{ label: 'finish', syntax: 'agf finish --prep [taskkey]', description: 'prepare a worktree by integrating the default branch and pushing when enabled' },
 	{ label: 'finish', syntax: 'agf finish --deliver [taskkey]', description: 'deliver a prepared worktree through the default branch and update the main checkout' },
 	{ label: 'cleanup', syntax: 'agf cleanup [taskkey] (aliases: clean, merge)', description: 'close a stream from the main checkout with the existing merge-preserving cleanup' },
 	{ label: 'ditch', syntax: 'agf ditch <taskkey>', description: 'abandon one stream after confirmation; no work is merged' },
@@ -1045,6 +1045,59 @@ const stream_doc = (repo, key) => {
 	return candidates.find((rel) => fs.existsSync(path.join(repo, rel))) || ''
 }
 
+// The stream's own record decides remote mutation. Without its worktree, the
+// committed copy on the stream branch outranks a delivered copy, so a missing
+// folder never silently falls back to pushing. A record without its
+// configuration refuses; a key with no stream record anywhere keeps the unset
+// default (on).
+const remote_sync = (dir, key) => {
+	const features = workspace_features(dir)
+	const notebook = path.posix.join(features, key, `${key}.devlog.md`)
+	const config = path.posix.join(features, key, 'ag.json')
+	const working = () => {
+		const file = path.join(dir, config)
+		if (fs.existsSync(file)) return { label: file, text: fs.readFileSync(file, 'utf8') }
+		if (fs.existsSync(path.join(dir, notebook))) throw new Error(`stream configuration ${file} is missing; restore the stream notebook/configuration pair`)
+		return null
+	}
+	const committed = ref => () => {
+		const exists = git(dir, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])
+		if (!exists.ok) {
+			if (exists.status === 1 && !exists.timed_out) return null
+			throw new Error(`could not inspect ${ref}`)
+		}
+		const listed = git(dir, ['ls-tree', '-z', '--name-only', ref, '--', notebook, config], { preserve_nul: true })
+		if (!listed.ok) throw new Error(`could not inspect the stream configuration on ${ref}`)
+		const names = listed.out.split('\0')
+		if (!names.includes(config)) {
+			if (names.includes(notebook)) throw new Error(`stream configuration ${ref}:${config} is missing; restore the stream notebook/configuration pair`)
+			return null
+		}
+		const blob = git_blob(dir, ['show', `${ref}:${config}`])
+		if (!blob.ok) throw new Error(`could not read stream configuration ${ref}:${config}`)
+		return { label: `${ref}:${config}`, text: blob.out.toString('utf8') }
+	}
+	const branch = committed(`refs/heads/${key}`)
+	const remote = committed(`refs/remotes/origin/${key}`)
+	const sources = key_from_path(path.resolve(dir)) === key ? [working, branch, remote] : [branch, working, remote]
+	for (const source of sources) {
+		const found = source()
+		if (found) return ag_settings.remote_sync_from_text(found.text, found.label)
+	}
+	return true
+}
+
+// The main checkout follows the configuration of the notebook it closes; no file means on.
+const main_remote_sync = (repo, notebook) => {
+	const file = ag_settings.active_config_path(repo, notebook)
+	return fs.existsSync(file) ? ag_settings.remote_sync_from_text(fs.readFileSync(file, 'utf8'), file) : true
+}
+
+const stream_push_setting = (dir, key) => {
+	try { return { auto_push: remote_sync(dir, key) } }
+	catch (error) { return { error: `cannot determine remote-sync for "${key}": ${error.message}` } }
+}
+
 const registered_worktrees = (repo) => {
 	const result = git(repo, ['worktree', 'list', '--porcelain'])
 	if (!result.ok) return []
@@ -1105,7 +1158,9 @@ const finish_context = (cwd, supplied_key) => {
 	if (selected.error) return { error: selected.error }
 	const def = selected.branch
 	if (!def || !local_branches(repo).includes(def)) return { error: 'cannot find the local default branch — set an existing branch with git config --local agentflow.default-branch <branch>' }
-	return { repo, git_common_dir, worktree, key, def, has_remote }
+	const setting = stream_push_setting(worktree, key)
+	if (setting.error) return { error: `${setting.error} — nothing was changed` }
+	return { repo, git_common_dir, worktree, key, def, has_remote, auto_push: setting.auto_push }
 }
 
 const merge_and_abort = (context, source, log) => {
@@ -1711,7 +1766,7 @@ const closing_record = (context) => {
 	const blob = git_blob(context.worktree, ['show', `${head.out}:${doc}`])
 	if (!blob.ok) return { error: `delivery could not read the committed stream notebook HEAD:${doc}: ${git_failure_detail('reading the closing notebook blob', blob)}` }
 	if (!valid_closing_blob(blob.out, context.key)) return closing_marker_error(context, doc)
-	if (context.has_remote) {
+	if (context.has_remote && context.auto_push) {
 		const remote = git(context.worktree, ['rev-parse', '--verify', `refs/remotes/origin/${context.key}`])
 		if (!remote.ok || remote.out !== head.out) {
 			return { error: `delivery requires origin/${context.key} to equal the current stream HEAD` }
@@ -1730,7 +1785,7 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 	if (context.error) { log(context.error); return 1 }
 
 	if (args.phase === 'prep') {
-		if (context.has_remote) {
+		if (context.has_remote && context.auto_push) {
 			const pushed = git(context.worktree, ['push', 'origin', `HEAD:${context.key}`])
 			if (!pushed.ok) {
 				log(pushed.timed_out
@@ -1748,11 +1803,11 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 			}
 			if (!merge_and_abort(context, `origin/${context.def}`, log)) return 1
 		} else {
-			log('no remote configured — the merge is local only')
+			log(context.has_remote ? 'remote-sync is off — the merge is local only' : 'no remote configured — the merge is local only')
 			if (!merge_and_abort(context, context.def, log)) return 1
 		}
 		log('phase 1 complete — write the closing round and commit it, then run agf finish --deliver')
-		if (context.has_remote) log(`before running agf finish --deliver, push the committed closing record to origin/${context.key}`)
+		if (context.has_remote && context.auto_push) log(`before running agf finish --deliver, push the committed closing record to origin/${context.key}`)
 		return 0
 	}
 
@@ -1760,7 +1815,7 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 	if (lock.error) { log(lock.error); return 1 }
 
 	const delivery_state = {
-		remote_default: context.has_remote ? 'not_attempted' : 'not_configured',
+		remote_default: context.has_remote && context.auto_push ? 'not_attempted' : 'not_configured',
 		local_checkout: 'not_attempted',
 	}
 	const delivery_status = (label, state) => {
@@ -1778,7 +1833,7 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 		const expected = main_checkout_identity(context.repo)
 		if (expected.error) { log(`delivery stopped — ${expected.error}`); return 1 }
 
-		if (context.has_remote) {
+		if (context.has_remote && context.auto_push) {
 			const source_error = delivery_source_error(context, record)
 			if (source_error) {
 				log(`delivery stopped before remote default-ref mutation — ${source_error}`)
@@ -1852,7 +1907,7 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 			return { dir: context.repo }
 		}
 
-		log('no remote configured — delivery is local only')
+		log(context.has_remote ? 'remote-sync is off — delivery is local only' : 'no remote configured — delivery is local only')
 		if (expected.branch !== context.def) {
 			log(`the main checkout is on "${expected.branch}", not "${context.def}" — nothing was changed`)
 			log(`recover with: ${local_main_recovery(context)}`)
@@ -1909,7 +1964,7 @@ const finish_main = (argv, cwd, log, _ask, width = 80) => {
 	} finally {
 		const release_error = release_delivery_lock(lock)
 		if (release_error) {
-			const remote_note = context.has_remote
+			const remote_note = context.has_remote && context.auto_push
 				? delivery_status('remote default-ref delivery', delivery_state.remote_default)
 				: 'remote default-ref delivery was not configured'
 			const local_note = delivery_status('local main-checkout delivery', delivery_state.local_checkout)
@@ -2003,7 +2058,7 @@ const new_main = (argv, cwd, log, ask, width = 80) => {
 		return 1
 	}
 	const has_remote = remote_listing.out !== ''
-	if (has_remote) {
+	if (has_remote && root_config.switches['remote-sync'] !== 'off') {
 		const pushed = git(wt, ['push', '-u', 'origin', taskkey])
 		log(pushed.ok
 			? `pushed branch ${taskkey} to origin`
@@ -2011,7 +2066,7 @@ const new_main = (argv, cwd, log, ask, width = 80) => {
 				? `stream branch push timed out after ${git_timeout_limit(pushed)}ms; remote branch state is unknown and the local branch remains available`
 				: 'stream branch push failed; the local branch remains available')
 	} else {
-		log('no remote configured — nothing pushed')
+		log(has_remote ? 'remote-sync is off — nothing pushed' : 'no remote configured — nothing pushed')
 	}
 
 	log('')
@@ -2054,7 +2109,8 @@ const branch_tip = (repo, key) => {
 	return fields[2] ? null : fields[1]
 }
 
-const deletion_remote = repo => {
+// With remote-sync off, cleanup and ditch never call this and stay offline.
+const deletion_remote = (repo) => {
 	const remotes = git(repo, ['remote'])
 	if (!remotes.ok) return { error: 'could not inspect configured remotes' }
 	if (!remotes.out) return { url: '' }
@@ -2073,6 +2129,12 @@ const server_tip = (repo, url, key) => {
 	if (!result.out) return ''
 	const fields = result.out.split(/\s+/u)
 	return fields.length === 2 && fields[1] === `refs/heads/${key}` && /^[0-9a-f]{40,64}$/.test(fields[0]) ? fields[0] : null
+}
+
+// Offline view of origin: the tip recorded by the last fetch, or '' when none is cached.
+const last_fetched_tip = (repo, branch) => {
+	const cached = git(repo, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`])
+	return cached.ok ? cached.out : ''
 }
 
 const deletion_worktree = (repo, key, wt, allow_present) => {
@@ -2167,6 +2229,9 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 
 	const wt_rel = path.join('.worktrees', key)
 	const wt = path.join(repo, wt_rel)
+	const push_setting = stream_push_setting(fs.existsSync(wt) ? wt : repo, key)
+	if (push_setting.error) { log(`${push_setting.error} — nothing was changed`); return 1 }
+	const auto_push = push_setting.auto_push
 
 	// Guard 3 — never remove the folder still used by the running host. A shell
 	// function can cd after this child exits, but an AI host runs its Stop hook
@@ -2188,13 +2253,23 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 		return 1
 	}
 
-	const destination = deletion_remote(repo)
+	// remote-sync off: no fetch, ls-remote or push; only local refs and the last-fetch cache.
+	const destination = auto_push ? deletion_remote(repo) : { url: '' }
 	if (destination.error) { log(`${destination.error} — nothing was changed`); return 1 }
 	const has_remote = Boolean(destination.url)
 	const worktree_before = deletion_worktree(repo, key, wt, true)
 	if (worktree_before.error) { log(worktree_before.error); return 1 }
 	const feature_tip = branch_tip(repo, key)
 	if (feature_tip === null) { log('could not inspect the local feature branch'); return 1 }
+	if (!auto_push && !feature_tip) {
+		log(`local branch ${key} does not exist, and remote-sync is off, so cleanup will not fetch it — nothing was changed`)
+		log(last_fetched_tip(repo, key)
+			? `create it from the last fetch, then run agf cleanup again:  git branch ${key} origin/${key}`
+			: git(repo, ['remote']).out.split('\n').includes('origin')
+				? `fetch it yourself, then run agf cleanup again:  git fetch origin ${key}:${key}`
+				: `no origin is configured, so there is no other copy of ${key} to restore`)
+		return 1
+	}
 	const local_tip_before = git(repo, ['rev-parse', '--verify', `refs/heads/${def}`])
 	const remote_tip_before = has_remote
 		? git(repo, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${def}`])
@@ -2206,6 +2281,15 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 	if (!local_tip_before.ok) {
 		log(`could not snapshot local ${def} before cleanup — nothing was changed`)
 		return 1
+	}
+	if (!auto_push) {
+		// A reminder only: the cache can be stale, so it never blocks cleanup.
+		for (const [branch, tip] of [[def, local_tip_before.out], [key, feature_tip]]) {
+			const cached = last_fetched_tip(repo, branch)
+			if (cached && !git(repo, ['merge-base', '--is-ancestor', cached, tip]).ok) {
+				log(`warning: according to the last fetch, origin/${branch} has commits that local ${branch} does not include; cleanup continues without fetching them`)
+			}
+		}
 	}
 
 	// Step 1 — level the default branch with the server.
@@ -2303,7 +2387,7 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 	if (remote_feature_tip_after && !git(repo, ['merge-base', '--is-ancestor', remote_feature_tip_after, merged_tip.out]).ok) { log('remote feature work is not contained in the merged default branch — nothing was swept'); return 1 }
 
 	// Step 3 — push the merge.
-	if (has_remote) {
+	if (has_remote && auto_push) {
 		const pushed = git(repo, ['push', destination.url, `${merged_tip.out}:refs/heads/${def}`])
 		if (!pushed.ok) {
 			log(pushed.timed_out
@@ -2320,7 +2404,7 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 		}
 		log(`pushed ${def} to origin`)
 	} else {
-		log('no remote configured — nothing pushed')
+		log(auto_push ? 'no remote configured — nothing pushed' : 'remote-sync is off — the merge remains local')
 	}
 
 	// Step 4 — sweep, each step refusing rather than destroying.
@@ -2354,7 +2438,7 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 		log(`removed folder ${wt_rel}`)
 	}
 	// Delete only the tips contained in the verified, published merge, regardless of upstream settings.
-	if (has_remote && remote_feature_tip_after) {
+	if (has_remote && auto_push && remote_feature_tip_after) {
 		const live_feature = git(repo, ['ls-remote', destination.url, `refs/heads/${key}`])
 		const live_feature_sha = live_feature.ok ? (live_feature.out.split(/\s+/u)[0] || '') : ''
 		if (live_feature_sha !== remote_feature_tip_after) {
@@ -2374,6 +2458,7 @@ const clean_main = (argv, cwd, log, ask, width = 80) => {
 	if (has_local) {
 		if (!delete_local_tip(repo, key, feature_tip, log)) return 1
 	}
+	if (!auto_push && last_fetched_tip(repo, key)) log(`remote branches were left unchanged; according to the last fetch, origin/${key} remains`)
 
 	// Step 5 — the one thing a shell cannot do.
 	const doc = stream_doc(repo, key)
@@ -2429,8 +2514,11 @@ const ditch_main = (argv, cwd, log, ask = ask_tty, width = 80) => {
 
 	const wt_rel = path.join('.worktrees', key)
 	const wt = path.join(repo, wt_rel)
+	const push_setting = stream_push_setting(fs.existsSync(wt) ? wt : repo, key)
+	if (push_setting.error) { log(`${push_setting.error} — nothing was changed`); return 1 }
+	const auto_push = push_setting.auto_push
 	if (real_path(top.out) === real_path(wt)) { log('exit this stream session and run ditch from the main project folder'); return 1 }
-	const destination = deletion_remote(repo)
+	const destination = auto_push ? deletion_remote(repo) : { url: '' }
 	if (destination.error) { log(`${destination.error} — nothing was changed`); return 1 }
 	const snapshot = discard_snapshot(repo, key, wt, destination.url)
 	if (snapshot.error) { log(`${snapshot.error} — nothing was changed`); return 1 }
@@ -2441,7 +2529,7 @@ const ditch_main = (argv, cwd, log, ask = ask_tty, width = 80) => {
 
 	const doomed = [
 		has_wt ? `folder ${wt_rel}, including any unsaved work inside it` : '',
-		has_remote_branch ? `branch ${key} on origin at ${snapshot.remote}` : '',
+		has_remote_branch && auto_push ? `branch ${key} on origin at ${snapshot.remote}` : '',
 		has_local ? `local branch ${key} at ${snapshot.local}` : '',
 	].filter(Boolean)
 	log(`feature branch "${key}" will be deleted — nothing is merged first, unmerged work is lost:`)
@@ -2466,7 +2554,7 @@ const ditch_main = (argv, cwd, log, ask = ask_tty, width = 80) => {
 		log('branch tips changed or could not be inspected; no branch deletion was attempted')
 		return 1
 	}
-	if (has_remote_branch) {
+	if (has_remote_branch && auto_push) {
 		const del = git(repo, ['push', destination.url, `:refs/heads/${key}`, `--force-with-lease=refs/heads/${key}:${snapshot.remote}`])
 		log(del.ok
 			? `deleted branch ${key} on origin`
@@ -2478,6 +2566,7 @@ const ditch_main = (argv, cwd, log, ask = ask_tty, width = 80) => {
 	if (has_local) {
 		if (!delete_local_tip(repo, key, snapshot.local, log)) return 1
 	}
+	if (!auto_push && last_fetched_tip(repo, key)) log(`remote-sync is off — origin/${key} was left unchanged (still present according to the last fetch)`)
 
 	const doc = stream_doc(repo, key)
 	if (doc) log(`the notebook ${doc} is already on ${def || 'the main line'} and stays — remove it by hand if you want it gone`)
@@ -2617,6 +2706,11 @@ const close_main = (argv, cwd, log, _ask, _width = 80) => {
 		const repo = repository.root
 		validated = close_validate_manifest(manifest, repo)
 		result = close_result({ manifest, close_id: validated.close_id })
+		const stream_key = key_from_path(repo)
+		if (manifest.delivery.mode === 'push' && !(stream_key ? remote_sync(repo, stream_key) : main_remote_sync(repo, manifest.notebook))) {
+			set_close_error(result, 'remote_sync_disabled', `remote-sync is off for this ${stream_key ? 'stream' : 'project'}`, 'use local delivery or explicitly change the setting before retrying')
+			return { json: result, exitCode: 1 }
+		}
 		if (manifest.delivery.mode === 'push' && !args.push_authorized) {
 			set_close_error(result, 'push_not_authorized', 'push delivery requires the separate --push-authorized command authority', 'obtain the already-authorized push decision, then retry the same manifest with --push-authorized')
 			return { json: result, exitCode: 1 }

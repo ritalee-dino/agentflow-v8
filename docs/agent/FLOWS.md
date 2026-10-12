@@ -158,10 +158,12 @@ Not supported on native Windows. Tests: `looper.test.js`, `queue-contract.test.j
 ```text
 agf new <name> [taskkey] [-m ask]   → agf.js:new_main
   validate config; create branch + .worktrees/<taskkey>; copy stream ag.json;
-  write <workspace>/features/<taskkey>/<taskkey>.devlog.md (devlog_template); commit; push if remote
+  write <workspace>/features/<taskkey>/<taskkey>.devlog.md (devlog_template); commit; push if remote and remote-sync is not off
 agf finish --prep  → finish_main: merge default branch into stream (abort on conflict), push
+                   (remote-sync off: merge the local default branch; no fetch or push)
 (host writes closing Reply, STATUS closed, commits)            (policy: references/streams.md)
 agf finish --deliver → finish_main: delivery lock; fast-forward default branch locally/remotely
+                   (remote-sync off: local only; cleanup/ditch also skip fetch, ls-remote, push)
 agf cleanup <key> (from main checkout) → clean_main
   stream-cleanup.js:inspect → preserve recognized local files into <git-common-dir>/agentflow-cleanup/...
   merge-preserving cleanup; remove worktree + branch; refuse from inside target worktree (I-058)

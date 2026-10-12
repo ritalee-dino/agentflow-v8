@@ -29,8 +29,8 @@ const pipeline_role_defaults = Object.freeze({
 	learn: 'basic',
 	threeways: 'better',
 })
-const switch_names = Object.freeze(['target-doc', 'workspace-dir', 'cli-provider', 'auto-reply', 'away-gates', 'log-verbosity', 'inline-reply', 'notebook-ownership', 'lang', 'streams', 'ask-names', 'allow-ag', 'large-work-minutes', 'git-timeout-ms', 'allowed-worker', 'review-policy', 'completion-cleanup', 'completion-cleanup-interval-days'])
-const optional_switch_names = Object.freeze(['completion-cleanup', 'completion-cleanup-interval-days', 'log-verbosity', 'inline-reply', 'notebook-ownership', 'git-timeout-ms', 'away-gates'])
+const switch_names = Object.freeze(['target-doc', 'workspace-dir', 'cli-provider', 'auto-reply', 'away-gates', 'log-verbosity', 'inline-reply', 'notebook-ownership', 'lang', 'streams', 'remote-sync', 'ask-names', 'allow-ag', 'large-work-minutes', 'git-timeout-ms', 'allowed-worker', 'review-policy', 'completion-cleanup', 'completion-cleanup-interval-days'])
+const optional_switch_names = Object.freeze(['completion-cleanup', 'completion-cleanup-interval-days', 'log-verbosity', 'inline-reply', 'notebook-ownership', 'git-timeout-ms', 'away-gates', 'remote-sync'])
 const legacy_switch_names = Object.freeze(['metrics'])
 const completion_cleanup_defaults = Object.freeze({ 'completion-cleanup': 'off', 'completion-cleanup-interval-days': 7 })
 const notebook_control_defaults = Object.freeze({ 'log-verbosity': 'all', 'inline-reply': 'off', 'notebook-ownership': 'off' })
@@ -179,6 +179,7 @@ const host_template_values = {
       'notebook-ownership': notebook_control_defaults['notebook-ownership'],
       'review-policy': 'prefer-independent',
       streams: 'ask',
+      'remote-sync': 'on',
       'target-doc': '.agentflow/devlog.md',
       'workspace-dir': '.agentflow',
     },
@@ -229,6 +230,7 @@ const host_template_values = {
       'notebook-ownership': notebook_control_defaults['notebook-ownership'],
       'review-policy': 'prefer-independent',
       streams: 'ask',
+      'remote-sync': 'on',
       'target-doc': '.agentflow/devlog.md',
       'workspace-dir': '.agentflow',
     },
@@ -672,6 +674,7 @@ const validate_switches = (config, options, expected_switches, provider_values, 
 		'inline-reply': ['on', 'off'],
 		'notebook-ownership': ['on', 'off'],
 		streams: ['ask', 'always', 'off'],
+		'remote-sync': ['on', 'off'],
 		'ask-names': ['on', 'off'],
 		'allow-ag': ['on', 'off', 'ask'],
 		'review-policy': ['prefer-independent', 'require-independent'],
@@ -950,6 +953,20 @@ const duplicate_json_key = text => {
 	try { return read_value() } catch (error) { return null }
 }
 
+// Strict read-only view of the remote-sync switch: no host detection,
+// migration or repair, and only this value is checked so older stream
+// configurations keep working. Unset means on; unreadable values throw.
+const remote_sync_from_text = (text, label) => {
+	if (duplicate_json_key(text) !== null) throw new SettingsError(`configuration ${label} contains duplicate keys`)
+	let config
+	try { config = JSON.parse(text) } catch (error) { throw new SettingsError(`configuration ${label} is not valid JSON: ${error.message}`) }
+	const switches = config?.switches
+	if (!switches || typeof switches !== 'object' || Array.isArray(switches)) throw new SettingsError(`configuration ${label} has no switches object`)
+	if (!has_own(switches, 'remote-sync')) return true
+	if (!['on', 'off'].includes(switches['remote-sync'])) throw new SettingsError(`configuration ${label} has switches.remote-sync other than on or off`)
+	return switches['remote-sync'] === 'on'
+}
+
 const read_json_config = (config_path, options = {}) => {
 	let text
 	try {
@@ -1042,6 +1059,7 @@ const canonical_config = config => ({
 		...Object.fromEntries(Object.keys(notebook_control_defaults).filter(key => has_own(config.switches, key)).map(key => [key, config.switches[key]])),
 		lang: config.switches.lang,
 		streams: config.switches.streams,
+		...(has_own(config.switches, 'remote-sync') ? { 'remote-sync': config.switches['remote-sync'] } : {}),
 		'ask-names': config.switches['ask-names'],
 		'allow-ag': config.switches['allow-ag'],
 		'large-work-minutes': config.switches['large-work-minutes'],
@@ -2001,7 +2019,7 @@ const render_dispatch_substitution = format_dispatch_substitution
 const switch_display_value = (config, key) => {
 	if (Array.isArray(config.switches[key])) return JSON.stringify(config.switches[key])
 	if (has_own(config.switches, key)) return config.switches[key]
-	return completion_cleanup_defaults[key] ?? notebook_control_defaults[key] ?? (key === 'away-gates' ? 'off' : key === 'git-timeout-ms' ? git_timeout_default_ms : config.switches[key])
+	return completion_cleanup_defaults[key] ?? notebook_control_defaults[key] ?? (key === 'remote-sync' ? 'on' : key === 'away-gates' ? 'off' : key === 'git-timeout-ms' ? git_timeout_default_ms : config.switches[key])
 }
 
 const format_settings_display = (config, options = {}) => {
@@ -2039,6 +2057,7 @@ const format_settings_display = (config, options = {}) => {
 		'- notebook-ownership: on or off (default off); on protects each Ask from other sessions; off retains file locks but allows mixed session work; use notebook-ownership: <value>',
 		'- lang: non-empty language tag or existing language name; use lang: <value>',
 		'- streams: ask, always, or off; use streams: <value>',
+		'- remote-sync: on or off (default on); off never fetches, queries or pushes a remote for streams or main closeout; use remote-sync: <value>',
 		'- ask-names: on or off; use ask-names: <value>',
 		'- allow-ag: on, off, or ask; use allow-ag: <value>',
 		'- large-work-minutes: integer from 1 through 10080; use large-work-minutes: <value>',
@@ -2188,6 +2207,7 @@ module.exports = {
 	configured_git_timeout_ms,
 	display_path,
 	duplicate_json_key,
+	remote_sync_from_text,
 	read_json_config,
 	load_config,
 	read_config,

@@ -168,7 +168,7 @@ test('version-8 templates contain the exact switches and defaults', () => {
 		const config = settings.make_template(host)
 		assert.equal(config['schema-version'], 8)
 		assert.deepEqual(Object.keys(config.switches), [
-		'allow-ag', 'allowed-worker', 'ask-names', 'auto-reply', 'away-gates', 'cli-provider', 'completion-cleanup', 'completion-cleanup-interval-days', 'git-timeout-ms', 'inline-reply', 'lang', 'large-work-minutes', 'log-verbosity', 'notebook-ownership', 'review-policy', 'streams', 'target-doc', 'workspace-dir',
+		'allow-ag', 'allowed-worker', 'ask-names', 'auto-reply', 'away-gates', 'cli-provider', 'completion-cleanup', 'completion-cleanup-interval-days', 'git-timeout-ms', 'inline-reply', 'lang', 'large-work-minutes', 'log-verbosity', 'notebook-ownership', 'review-policy', 'streams', 'remote-sync', 'target-doc', 'workspace-dir',
 		])
 		assert.equal(config.switches['away-gates'], 'off')
 		assert.equal(config.switches['allow-ag'], 'on')
@@ -179,6 +179,7 @@ test('version-8 templates contain the exact switches and defaults', () => {
 		assert.equal(config.switches['review-policy'], 'prefer-independent')
 		assert.equal(config.switches['completion-cleanup'], 'off')
 		assert.equal(config.switches['completion-cleanup-interval-days'], 7)
+		assert.equal(config.switches['remote-sync'], 'on')
 		assert.equal(config['external-workers'].length, 2)
 		assert.equal(settings.validate_config(config, { active_host: host, ...all_executables }).valid, true)
 	}
@@ -257,6 +258,29 @@ test('schema-8 configs may omit optional cleanup switches and changes/help expos
 	let help_text = ''
 	assert.equal(settings.cli_main(['help'], { output: value => { help_text = value }, error: () => {} }), 0)
 	assert.match(help_text, /completion-cleanup-interval-days/)
+})
+
+test('remote-sync defaults to on and accepts an independent off setting', () => {
+	const config = settings.make_template('codex')
+	delete config.switches['remote-sync']
+	assert.equal(settings.validate_config(config, { active_host: 'codex', ...all_executables }).valid, true)
+	const changed = settings.apply_changes(config, ['remote-sync: off'], { active_host: 'codex', ...all_executables })
+	assert.equal(changed.config.switches['remote-sync'], 'off')
+	const invalid = settings.make_template('codex')
+	invalid.switches['remote-sync'] = 'maybe'
+	expect_invalid(invalid, /switches\.remote-sync.*one of/)
+	const display = settings.format_settings_display(config, all_executables)
+	assert.match(display, /remote-sync: on/)
+	assert.match(display, /off never fetches, queries or pushes/)
+})
+
+test('remote-sync reader checks only its own value so older stream configurations keep working', () => {
+	assert.equal(settings.remote_sync_from_text('{"schema-version":5,"switches":{"streams":"ask"}}', 'old', '/repo'), true)
+	assert.equal(settings.remote_sync_from_text('{"switches":{"remote-sync":"off"}}', 'partial', '/repo'), false)
+	assert.throws(() => settings.remote_sync_from_text('{"switches":{"remote-sync":"maybe"}}', 'bad', '/repo'), /remote-sync/)
+	assert.throws(() => settings.remote_sync_from_text('{"switches":[]}', 'shape', '/repo'), /switches/)
+	assert.throws(() => settings.remote_sync_from_text('{"switches":{"remote-sync":"off","remote-sync":"on"}}', 'dup', '/repo'), /duplicate/)
+	assert.throws(() => settings.remote_sync_from_text('{', 'broken', '/repo'), /not valid JSON/)
 })
 
 test('profile validation accepts the exact v8 shape and diagnoses legacy worker keys', () => {

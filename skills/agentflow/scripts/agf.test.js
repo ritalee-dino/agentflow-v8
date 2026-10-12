@@ -975,11 +975,12 @@ const close_manifest = (root, delivery = { mode: 'local' }) => {
 	}
 }
 
-const close_fixture = ({ remote = false, notebook_ownership = 'off' } = {}) => {
+const close_fixture = ({ remote = false, notebook_ownership = 'off', remote_sync = 'on' } = {}) => {
 	const fixture = make_repo({ remote })
 	const config = ag_settings.make_template('codex')
 	config.switches['target-doc'] = 'devlog.md'
 	config.switches['notebook-ownership'] = notebook_ownership
+	config.switches['remote-sync'] = remote_sync
 	fs.writeFileSync(path.join(fixture.dir, 'ag.json'), `${JSON.stringify(config, null, 2)}\n`)
 	fs.writeFileSync(path.join(fixture.dir, 'devlog.md'), `${ag_settings.format_status({
 		project: 'demo — a test',
@@ -1402,6 +1403,24 @@ test('authorized push fetches and verifies a local remote without force', () => 
 		fs.rmSync(fixture.dir, { recursive: true, force: true })
 		if (fixture.bare) fs.rmSync(fixture.bare, { recursive: true, force: true })
 	}
+})
+
+test('remote-sync off rejects main-workspace push closeout before mutation', () => {
+	const fixture = close_fixture({ remote: true, remote_sync: 'off' })
+	try {
+		fs.appendFileSync(path.join(fixture.dir, 'devlog.md'), '\n+ review it yourself\n')
+		const notebook_before = fs.readFileSync(path.join(fixture.dir, 'devlog.md'))
+		const remote_before = fixture.run(['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0]
+		const manifest = close_manifest(fixture.dir, { mode: 'push', remote: 'origin', branch: 'main' })
+		manifest.reply += '\n```completion-metadata\nHost review: PASS — inspected the isolated main-workspace push fixture and its remote SHA.\n```\n'
+		const result = spawnSync(process.execPath, [path.join(__dirname, 'agf.js'), 'close', '--manifest-stdin', '--push-authorized'], {
+			cwd: fixture.dir, input: JSON.stringify(manifest), encoding: 'utf8',
+		})
+		assert.notEqual(result.status, 0)
+		assert.equal(JSON.parse(result.stdout).error.code, 'remote_sync_disabled')
+		assert.deepEqual(fs.readFileSync(path.join(fixture.dir, 'devlog.md')), notebook_before)
+		assert.equal(fixture.run(['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0], remote_before)
+	} finally { drop(fixture.dir, fixture.bare) }
 })
 
 test('delivery retry uses the saved closeout commit after the next Ask is captured', () => {
@@ -1878,6 +1897,252 @@ test('finish local-only preparation and delivery never need a remote', () => {
 	assert.equal(run(['rev-parse', 'HEAD']), run(['rev-parse', 'login-page']))
 	assert.ok(!fs.existsSync(agf.delivery_lock_path({ git_common_dir: path.join(dir, '.git') })))
 	drop(dir)
+})
+
+// Records every Git process started inside fn, including nested ones such as
+// upload-pack, and returns the names of those that contact a remote.
+const network_git = /^(fetch|fetch-pack|pull|push|send-pack|ls-remote|upload-pack|receive-pack|remote-.+)$/
+const remote_contacts = fn => {
+	const trace = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'agf-trace-')), 'trace.json')
+	const previous = process.env.GIT_TRACE2_EVENT
+	process.env.GIT_TRACE2_EVENT = trace
+	try { fn() } finally {
+		if (previous === undefined) delete process.env.GIT_TRACE2_EVENT
+		else process.env.GIT_TRACE2_EVENT = previous
+	}
+	const events = fs.existsSync(trace) ? fs.readFileSync(trace, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
+	fs.rmSync(path.dirname(trace), { recursive: true, force: true })
+	return events.filter(event => event.event === 'cmd_name' && network_git.test(event.name)).map(event => event.name)
+}
+
+test('remote-sync off completes and cleans a stream locally while origin is unreachable', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const config_file = path.join(dir, 'ag.json')
+		const config = JSON.parse(fs.readFileSync(config_file, 'utf8'))
+		config.switches['remote-sync'] = 'off'
+		fs.writeFileSync(config_file, `${JSON.stringify(config, null, 2)}\n`)
+		run(['add', 'ag.json'])
+		run(['commit', '-m', 'disable remote sync'])
+		const remote_main = run(['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0]
+		assert.deepEqual(remote_contacts(() => run(['ls-remote', bare])), ['ls-remote', 'upload-pack'])
+		const new_logs = []
+		let opened
+		assert.deepEqual(remote_contacts(() => { opened = agf.main(['new', 'login page'], dir, message => new_logs.push(message)) }), [])
+		assert.ok(opened.dir, new_logs.join('\n'))
+		const wt = opened.dir
+		assert.equal(run(['ls-remote', 'origin', 'refs/heads/login-page']).trim(), '')
+		run(['push', 'origin', 'login-page'], wt)
+		const remote_feature = run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0]
+		// Stands in for an offline server or HTTP 403: every network call to origin fails.
+		run(['remote', 'set-url', 'origin', path.join(dir, 'unreachable-origin')])
+		run(['remote', 'add', 'second', bare])
+		const cached = () => run(['for-each-ref', 'refs/remotes'])
+		const cache_before = cached()
+		commit_stream_file(run, wt, 'feature.txt', 'feature\n')
+		const prep_logs = []
+		assert.deepEqual(remote_contacts(() => assert.equal(agf.main(['finish', '--prep'], wt, message => prep_logs.push(message)), 0)), [])
+		assert.ok(prep_logs.some(message => message.includes('remote-sync is off')))
+		assert.ok(!prep_logs.some(message => message.includes('push the committed closing record')))
+		close_local_stream(run, wt, 'login-page')
+		assert.deepEqual(remote_contacts(() => assert.equal(path.resolve(agf.main(['finish', '--deliver'], wt, () => {}).dir), dir)), [])
+		const cleanup_logs = []
+		assert.deepEqual(remote_contacts(() => assert.equal(path.resolve(agf.main(['cleanup', 'login-page'], dir, message => cleanup_logs.push(message)).dir), dir, cleanup_logs.join('\n'))), [])
+		assert.ok(cleanup_logs.some(message => message.includes('merge remains local')))
+		assert.ok(!fs.existsSync(wt))
+		assert.equal(run(['branch', '--list', 'login-page']).trim(), '')
+		assert.equal(cached(), cache_before)
+		assert.equal(run(['ls-remote', bare, 'refs/heads/main']).split('\t')[0], remote_main)
+		assert.equal(run(['ls-remote', bare, 'refs/heads/login-page']).split('\t')[0], remote_feature)
+	} finally { drop(dir, bare) }
+})
+
+test('remote-sync off leaves a manually published branch on ditch', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const config_file = path.join(dir, 'ag.json')
+		const config = JSON.parse(fs.readFileSync(config_file, 'utf8'))
+		config.switches['remote-sync'] = 'off'
+		fs.writeFileSync(config_file, `${JSON.stringify(config, null, 2)}\n`)
+		run(['add', 'ag.json'])
+		run(['commit', '-m', 'disable remote sync'])
+		const new_logs = []
+		const opened = agf.main(['new', 'login page'], dir, message => new_logs.push(message))
+		assert.ok(opened.dir, new_logs.join('\n'))
+		const wt = opened.dir
+		run(['push', 'origin', 'login-page'], wt)
+		const remote_feature = run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0]
+		run(['remote', 'set-url', 'origin', path.join(dir, 'unreachable-origin')])
+		run(['remote', 'add', 'second', bare])
+		const logs = []
+		assert.deepEqual(remote_contacts(() => assert.equal(path.resolve(agf.main(['ditch', 'login-page'], dir, message => logs.push(message), () => 'Y\n').dir), dir, logs.join('\n'))), [])
+		assert.ok(logs.some(message => message.includes('origin/login-page was left unchanged')))
+		assert.ok(!fs.existsSync(wt))
+		assert.equal(run(['branch', '--list', 'login-page']).trim(), '')
+		assert.equal(run(['ls-remote', bare, 'refs/heads/login-page']).split('\t')[0], remote_feature)
+	} finally { drop(dir, bare) }
+})
+
+const open_local_only_stream = (dir, run) => {
+	const config_file = path.join(dir, 'ag.json')
+	const config = JSON.parse(fs.readFileSync(config_file, 'utf8'))
+	config.switches['remote-sync'] = 'off'
+	fs.writeFileSync(config_file, `${JSON.stringify(config, null, 2)}\n`)
+	run(['add', 'ag.json'])
+	run(['commit', '-m', 'disable remote sync'])
+	const new_logs = []
+	const opened = agf.main(['new', 'login page'], dir, message => new_logs.push(message))
+	assert.ok(opened.dir, new_logs.join('\n'))
+	run(['push', 'origin', 'login-page'], opened.dir)
+	return opened.dir
+}
+
+test('remote-sync off reads the committed branch setting when the worktree folder is gone', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const wt = open_local_only_stream(dir, run)
+		const remote_feature = run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0]
+		fs.rmSync(wt, { recursive: true, force: true })
+		run(['worktree', 'prune'])
+		const logs = []
+		assert.equal(path.resolve(agf.main(['ditch', 'login-page'], dir, message => logs.push(message), () => 'Y\n').dir), dir, logs.join('\n'))
+		assert.ok(logs.some(message => message.includes('origin/login-page was left unchanged')), logs.join('\n'))
+		assert.equal(run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0], remote_feature)
+	} finally { drop(dir, bare) }
+})
+
+test('remote-sync off refuses cleanup without a local feature branch and explains how to create one', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const wt = open_local_only_stream(dir, run)
+		run(['worktree', 'remove', '--force', wt])
+		run(['branch', '-D', 'login-page'])
+		run(['remote', 'set-url', 'origin', path.join(dir, 'unreachable-origin')])
+		const main_before = run(['rev-parse', 'main'])
+		const cache_before = run(['for-each-ref', 'refs/remotes'])
+		const logs = []
+		assert.equal(agf.main(['cleanup', 'login-page'], dir, message => logs.push(message)), 1)
+		assert.ok(logs.some(message => message.includes('nothing was changed')), logs.join('\n'))
+		assert.ok(logs.some(message => message.includes('git branch login-page origin/login-page')), logs.join('\n'))
+		assert.equal(run(['rev-parse', 'main']), main_before)
+		assert.equal(run(['for-each-ref', 'refs/remotes']), cache_before)
+	} finally { drop(dir, bare) }
+})
+
+test('remote-sync off with origin but no cached feature branch tells the owner to fetch it', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const wt = open_local_only_stream(dir, run)
+		commit_stream_file(run, wt, 'feature.txt', 'feature\n')
+		assert.equal(agf.main(['finish', '--prep'], wt, () => {}), 0)
+		close_local_stream(run, wt, 'login-page')
+		assert.equal(path.resolve(agf.main(['finish', '--deliver'], wt, () => {}).dir), dir)
+		run(['worktree', 'remove', '--force', wt])
+		run(['branch', '-D', 'login-page'])
+		run(['update-ref', '-d', 'refs/remotes/origin/login-page'])
+		const main_before = run(['rev-parse', 'main'])
+		const logs = []
+		assert.deepEqual(remote_contacts(() => assert.equal(agf.main(['cleanup', 'login-page'], dir, message => logs.push(message)), 1)), [])
+		assert.ok(logs.some(message => message.includes('nothing was changed')), logs.join('\n'))
+		assert.ok(logs.some(message => message.includes('git fetch origin login-page:login-page')), logs.join('\n'))
+		assert.equal(run(['rev-parse', 'main']), main_before)
+	} finally { drop(dir, bare) }
+})
+
+test('remote-sync off without origin does not suggest fetching a missing feature branch', () => {
+	const { dir, run } = make_repo()
+	try {
+		const config_file = path.join(dir, 'ag.json')
+		const config = JSON.parse(fs.readFileSync(config_file, 'utf8'))
+		config.switches['remote-sync'] = 'off'
+		fs.writeFileSync(config_file, `${JSON.stringify(config, null, 2)}\n`)
+		run(['add', 'ag.json'])
+		run(['commit', '-m', 'disable remote sync'])
+		const wt = open_stream(dir, 'login page')
+		commit_stream_file(run, wt, 'feature.txt', 'feature\n')
+		close_local_stream(run, wt, 'login-page')
+		const first = []
+		assert.equal(path.resolve(agf.main(['cleanup', 'login-page'], dir, message => first.push(message)).dir), dir, first.join('\n'))
+		const main_before = run(['rev-parse', 'main'])
+		const logs = []
+		assert.equal(agf.main(['cleanup', 'login-page'], dir, message => logs.push(message)), 1)
+		assert.ok(logs.some(message => message.includes('nothing was changed')), logs.join('\n'))
+		assert.ok(logs.some(message => message.includes('no origin is configured')), logs.join('\n'))
+		assert.ok(!logs.some(message => message.includes('git fetch')), logs.join('\n'))
+		assert.equal(run(['rev-parse', 'main']), main_before)
+	} finally { drop(dir) }
+})
+
+test('remote-sync off warns from the last fetch without blocking cleanup', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const wt = open_local_only_stream(dir, run)
+		commit_stream_file(run, wt, 'feature.txt', 'feature\n')
+		close_local_stream(run, wt, 'login-page')
+		run(['remote', 'set-url', 'origin', path.join(dir, 'unreachable-origin')])
+		// The last fetch saw newer commits on both origin branches.
+		const ahead = ref => run(['commit-tree', `${ref}^{tree}`, '-p', ref, '-m', 'teammate work']).trim()
+		run(['update-ref', 'refs/remotes/origin/main', ahead('main')])
+		run(['update-ref', 'refs/remotes/origin/login-page', ahead('login-page')])
+		const cache_before = run(['for-each-ref', 'refs/remotes'])
+		const logs = []
+		assert.equal(path.resolve(agf.main(['cleanup', 'login-page'], dir, message => logs.push(message)).dir), dir, logs.join('\n'))
+		const warned = name => logs.some(message => message.includes('according to the last fetch') && message.includes(name))
+		assert.ok(warned('origin/main'), logs.join('\n'))
+		assert.ok(warned('origin/login-page'), logs.join('\n'))
+		assert.equal(run(['branch', '--list', 'login-page']).trim(), '')
+		assert.equal(run(['for-each-ref', 'refs/remotes']), cache_before)
+	} finally { drop(dir, bare) }
+})
+
+test('an unreadable stream setting refuses ditch and cleanup before changing refs', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const wt = open_local_only_stream(dir, run)
+		const remote_feature = run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0]
+		const local_feature = run(['rev-parse', 'refs/heads/login-page'])
+		const stream_config = path.join(wt, '.agentflow', 'features', 'login-page', 'ag.json')
+		assert.ok(fs.existsSync(stream_config), 'the stream must have an adjacent configuration')
+		fs.writeFileSync(stream_config, '{"switches": ')
+		for (const command of [['ditch', 'login-page'], ['cleanup', 'login-page']]) {
+			const logs = []
+			assert.equal(agf.main(command, dir, message => logs.push(message), () => 'Y\n'), 1)
+			assert.ok(logs.some(message => message.includes('cannot determine remote-sync for "login-page"') && message.includes('nothing was changed')), logs.join('\n'))
+		}
+		assert.ok(fs.existsSync(wt))
+		assert.equal(run(['rev-parse', 'refs/heads/login-page']), local_feature)
+		assert.equal(run(['ls-remote', 'origin', 'refs/heads/login-page']).split('\t')[0], remote_feature)
+	} finally { drop(dir, bare) }
+})
+
+test('remote-sync off rejects an authorized push closeout before mutation', () => {
+	const { dir, run, bare } = make_repo({ remote: true })
+	try {
+		const config_file = path.join(dir, 'ag.json')
+		const config = JSON.parse(fs.readFileSync(config_file, 'utf8'))
+		config.switches['remote-sync'] = 'off'
+		fs.writeFileSync(config_file, `${JSON.stringify(config, null, 2)}\n`)
+		run(['add', 'ag.json'])
+		run(['commit', '-m', 'disable remote sync'])
+		const opened = agf.main(['new', 'login page'], dir, () => {})
+		assert.ok(opened.dir)
+		const wt = opened.dir
+		const notebook = '.agentflow/features/login-page/login-page.devlog.md'
+		const before = fs.readFileSync(path.join(wt, notebook))
+		const manifest = close_manifest(wt, { mode: 'push', remote: 'origin', branch: 'login-page' })
+		manifest.notebook = notebook
+		manifest.status.notebook = notebook
+		manifest.status.notebook_kind = 'stream'
+		manifest.status.config_path = '.agentflow/features/login-page/ag.json'
+		manifest.allowed_paths = [notebook]
+		const result = spawnSync(process.execPath, [path.join(__dirname, 'agf.js'), 'close', '--manifest-stdin', '--push-authorized'], {
+			cwd: wt, input: JSON.stringify(manifest), encoding: 'utf8',
+		})
+		assert.notEqual(result.status, 0)
+		assert.equal(JSON.parse(result.stdout).error.code, 'remote_sync_disabled')
+		assert.deepEqual(fs.readFileSync(path.join(wt, notebook)), before)
+		assert.equal(run(['ls-remote', 'origin', 'refs/heads/login-page']).trim(), '')
+	} finally { drop(dir, bare) }
 })
 
 test('finish preparation never invokes the editor when Git auto-edit is enabled', () => {
