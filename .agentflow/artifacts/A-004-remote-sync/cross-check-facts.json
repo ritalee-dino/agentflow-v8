@@ -1,0 +1,24 @@
+{
+  "changed_files": [
+    "docs/agent/ARCHITECTURE.md",
+    "docs/agent/FEATURES.md",
+    "docs/agent/FLOWS.md",
+    "skills/agentflow/SKILL.md",
+    "skills/agentflow/docs/AG_GUIDE.md",
+    "skills/agentflow/docs/AG_GUIDE.zh-tw.md",
+    "skills/agentflow/references/closeout.md",
+    "skills/agentflow/references/streams.md",
+    "skills/agentflow/scripts/README.md",
+    "skills/agentflow/scripts/ag-settings.js",
+    "skills/agentflow/scripts/ag-settings.test.js",
+    "skills/agentflow/scripts/agf.js",
+    "skills/agentflow/scripts/agf.test.js",
+    "skills/agentflow/scripts/round-linter.js",
+    "skills/agentflow/scripts/round-linter.test.js"
+  ],
+  "changed_lines": 557,
+  "behavior_change": true,
+  "trust_boundary": false,
+  "broad_change": false,
+  "consequential_change": false
+}
