@@ -23,7 +23,7 @@
     "streams": "off",
     "target-doc": ".agentflow/devlog.md",
     "workspace-dir": ".agentflow",
-    "stream-auto-push": "off",
+    "remote-sync": "off",
     "worktree-local-notebook": "on"
   },
   "pipeline-roles": {
